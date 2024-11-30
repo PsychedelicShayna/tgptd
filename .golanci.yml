@@ -1,0 +1,4 @@
+gofmt:
+ formatOnSave: true
+ gofumptConfig:
+    indentSize: 4

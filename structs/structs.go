@@ -7,6 +7,8 @@ type Params struct {
 	Temperature  string
 	Top_p        string
 	Max_length   string
+        IfInput      string
+        IfOutput     string
 	Preprompt    string
 	ThreadID     string
 	Url          string

@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aandrew-me/tgpt/v2/structs"
 	"github.com/aandrew-me/tgpt/v2/utils"
@@ -45,6 +47,8 @@ var url *string
 var logFile *string
 var shouldExecuteCommand *bool
 var disableInputLimit *bool
+var ifInput *string
+var ifOutput *string
 
 func main() {
 	execPath, err := os.Executable()
@@ -60,6 +64,8 @@ func main() {
 
 	args := os.Args
 
+	ifInput = flag.String("ifi", "", "Specify input file for interactive mode with file I/O")
+	ifOutput = flag.String("ifo", "", "Specify output file for interactive mode with file I/O")
 	apiModel = flag.String("model", "", "Choose which model to use")
 	provider = flag.String("provider", os.Getenv("AI_PROVIDER"), "Choose which provider to use")
 	apiKey = flag.String("key", "", "Use personal API Key")
@@ -107,6 +113,13 @@ func main() {
 	disableInputLimit := flag.Bool("disable-input-limit", false, "Disables the checking of 4000 character input limit")
 
 	flag.Parse()
+
+	isIfInput := len(*ifInput) > 0
+
+        if isIfInput {
+          *isInteractive = isIfInput
+        }
+
 
 	prompt := flag.Arg(0)
 
@@ -182,11 +195,11 @@ func main() {
 					fmt.Fprintln(os.Stderr, `Example: tgpt -q "What is encryption?"`)
 					os.Exit(1)
 				}
-				getSilentText(*preprompt + trimmedPrompt + contextText + pipedInput, structs.ExtraOptions{DisableInputLimit: *disableInputLimit})
+				getSilentText(*preprompt+trimmedPrompt+contextText+pipedInput, structs.ExtraOptions{DisableInputLimit: *disableInputLimit})
 			} else {
 				formattedInput := getFormattedInputStdin()
 				fmt.Println()
-				getSilentText(*preprompt + formattedInput + cleanPipedInput, structs.ExtraOptions{DisableInputLimit: *disableInputLimit})
+				getSilentText(*preprompt+formattedInput+cleanPipedInput, structs.ExtraOptions{DisableInputLimit: *disableInputLimit})
 			}
 		case *isShell:
 			if len(prompt) > 1 {
@@ -220,6 +233,101 @@ func main() {
 			}
 		case *isUpdate:
 			update()
+
+		case isIfInput:
+			/////////////////////
+			// Interactive with file I/O
+			/////////////////////
+
+			previousMessages := ""
+			history := []string{}
+			threadID := utils.RandomString(36)
+
+			if len(*ifInput) <= 0 {
+				fmt.Fprintln(os.Stderr, "You need to provide an input file")
+				os.Exit(1)
+			}
+
+			// Interactive with file I/O will poll a file and wait for the
+			// content to not be empty. When the content is not empty, it will
+			// send the content to the API and write the response to the output file,
+			// if provided, otherwise it will print the response to the console.
+			// ifInput is the input file and ifOutput is the output file.
+
+			for {
+				// Check if the input file exists
+
+				_, err := os.Stat(*ifInput)
+
+				if err != nil {
+					if os.IsNotExist(err) {
+						// Sleep for 1 second before polling the file again
+						time.Sleep(50 * time.Millisecond)
+						continue
+
+					} else {
+						// Report error if the file exists but there is an error
+						fmt.Fprintln(os.Stderr, "Error checking input file:", err)
+					}
+
+				}
+
+				input, err := fs.ReadFile(os.DirFS("."), *ifInput)
+
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Error reading input file:", err)
+					os.Exit(1)
+				}
+
+				if len(input) <= 0 {
+					// Sleep for 1 second before polling the file again
+					time.Sleep(50 * time.Millisecond)
+					continue
+				} else {
+					// Wipe the input file
+					err := os.WriteFile(*ifInput, []byte(""), 0644)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "Error wiping input file:", err)
+						os.Exit(1)
+					}
+				}
+
+				// decode the input file from bytes to string
+				inputString := string(input)
+				inputString = strings.TrimSpace(string(inputString))
+
+				// Use preprompt for first message
+				if previousMessages == "" {
+					inputString = *preprompt + inputString
+				}
+
+				// We now have our input, let's send it to the API
+				responseJson, responseTxt := getData(inputString, structs.Params{
+					PrevMessages: previousMessages,
+					ThreadID:     threadID,
+					Provider:     *provider,
+				}, structs.ExtraOptions{IsInteractive: true, DisableInputLimit: *disableInputLimit, IsNormal: true})
+
+				// Check if we have an output file
+
+				if len(*ifOutput) > 0 {
+					// Write the response to the output file
+					err := os.WriteFile(*ifOutput, []byte(responseTxt), 0644)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "Error writing to output file:", err)
+						os.Exit(1)
+					}
+				} else {
+					// Print the response to the console
+					fmt.Println(responseTxt)
+				}
+
+				// Append the response to the previous messages
+				previousMessages += responseJson
+				history = append(history, inputString)
+				lastResponse = responseTxt
+			}
+
 		case *isInteractive:
 			/////////////////////
 			// Normal interactive
@@ -455,7 +563,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	// We handle errors just like any other message
+		// We handle errors just like any other message
 	case errMsg:
 		m.err = msg
 		return m, nil
@@ -502,6 +610,8 @@ func showHelpMessage() {
 	fmt.Printf("%-50v Print help message \n", "-h, --help")
 	fmt.Printf("%-50v Start normal interactive mode \n", "-i, --interactive")
 	fmt.Printf("%-50v Start multi-line interactive mode \n", "-m, --multiline")
+	fmt.Printf("%-50v Start interactive mode with file I/O \n", "--ifi <infile>")
+	fmt.Printf("%-50v Output interactive mode to file, only used with --ifi \n", "--ifo <outfile>")
 	fmt.Printf("%-50v See changelog of versions \n", "-cl, --changelog")
 
 	if runtime.GOOS != "windows" {
